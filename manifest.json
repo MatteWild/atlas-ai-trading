@@ -1,0 +1,9 @@
+{
+  "name": "Neo Index",
+  "short_name": "Neo Index",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#080e19",
+  "theme_color": "#080e19",
+  "icons": []
+}
