@@ -1,9 +1,0 @@
-{
-  "name": "ATLAS AI TRADING",
-  "short_name": "ATLAS AI",
-  "start_url": "./",
-  "display": "standalone",
-  "background_color": "#0b1220",
-  "theme_color": "#101827",
-  "description": "Prototipo ATLAS con collegamenti sperimentali a quotazioni e notizie"
-}
