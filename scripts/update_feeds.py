@@ -1,19 +1,93 @@
 import json
+import os
+import re
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from math import isfinite
 from pathlib import Path
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
-SYMBOLS = ('GC=F', 'EURUSD=X', 'NQ=F', 'SI=F')
+SYMBOLS = ('EURUSD=X', 'NQ=F', 'SI=F')
 
 
 def get_json(url):
     request = Request(url, headers={'Accept': 'application/json', 'User-Agent': 'AtlasNeoIndex/4'})
     with urlopen(request, timeout=12) as response:
         return json.load(response)
+
+
+def get_gold():
+    key = os.environ.get('TWELVE_DATA_API_KEY', '').strip()
+    unavailable = {'symbol': 'XAU/USD', 'status': 'UNAVAILABLE'}
+    if not key:
+        return {**unavailable, 'reason': 'Configura la fonte Twelve Data nel repository'}
+    params = urlencode({'symbol': 'XAU/USD', 'interval': '15min', 'timezone': 'UTC', 'outputsize': 96})
+    try:
+        request = Request(
+            'https://api.twelvedata.com/time_series?' + params,
+            headers={'Authorization': 'apikey ' + key, 'Accept': 'application/json'},
+        )
+        with urlopen(request, timeout=12) as response:
+            payload = json.load(response)
+        if payload.get('meta', {}).get('symbol') != 'XAU/USD':
+            raise ValueError('Unexpected symbol')
+        now = datetime.now(timezone.utc)
+        candles = {}
+        for row in payload['values']:
+            opened = datetime.fromisoformat(row['datetime']).replace(tzinfo=timezone.utc)
+            closed = opened + timedelta(minutes=15)
+            close = float(row['close'])
+            if closed <= now and isfinite(close) and close > 0:
+                candles[closed] = close
+        samples = sorted(candles.items())
+        if len(samples) < 50:
+            raise ValueError('Not enough completed candles')
+        timestamp, close = samples[-1]
+        return {
+            'symbol': 'XAU/USD', 'status': 'INDICATIVE', 'price': close,
+            'time': int(timestamp.timestamp() * 1000), 'decimals': 2,
+            'closes': [price for _, price in samples],
+        }
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {**unavailable, 'reason': 'Twelve Data non ha restituito uno storico XAU/USD valido'}
+
+
+def get_calendar():
+    def event_time(line):
+        head, value = line.split(':', 1)
+        if value.endswith('Z'):
+            return datetime.strptime(value, '%Y%m%dT%H%M%SZ').replace(tzinfo=timezone.utc)
+        if 'T' not in value:
+            return None
+        match = re.search(r'TZID=([^;:]+)', head)
+        zone = ZoneInfo(match[1].strip('"')) if match else ZoneInfo('America/New_York')
+        return datetime.strptime(value, '%Y%m%dT%H%M%S').replace(tzinfo=zone)
+
+    try:
+        url = 'https://www.bls.gov/schedule/news_release/bls.ics'
+        with urlopen(Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=10) as response:
+            raw = response.read(2000000).decode('utf-8-sig')
+        unfolded = re.sub(r'\r?\n[ \t]', '', raw)
+        if 'BEGIN:VCALENDAR' not in unfolded:
+            raise ValueError('Invalid iCalendar')
+        events = []
+        now = datetime.now(timezone.utc)
+        important = ('consumer price index', 'producer price index', 'employment situation', 'employment cost index')
+        for event in re.findall(r'BEGIN:VEVENT\r?\n(.*?)END:VEVENT', unfolded, re.S):
+            lines = event.splitlines()
+            title = next((line.split(':', 1)[1] for line in lines if line.startswith('SUMMARY:')), '')
+            date = next((line for line in lines if line.startswith(('DTSTART:', 'DTSTART;'))), '')
+            if not date or not any(term in title.lower() for term in important):
+                continue
+            when = event_time(date)
+            if when and now <= when:
+                events.append({'title': title, 'time': when.astimezone(timezone.utc).isoformat()})
+        return {'events': sorted(events, key=lambda event: event['time'])[:12]}
+    except (OSError, ValueError, KeyError):
+        return {'events': [], 'error': 'Calendario BLS non disponibile'}
 
 
 def get_quote(symbol):
@@ -93,14 +167,19 @@ def get_official_news():
 
 def publish(directory):
     directory.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         news = pool.submit(get_news)
+        calendar = pool.submit(get_calendar)
+        gold = pool.submit(get_gold)
         quotes = list(pool.map(get_quote, SYMBOLS))
+        quotes.insert(0, gold.result())
         articles = news.result()
+        schedule = calendar.result()
     fetched = datetime.now(timezone.utc).isoformat()
     for name, payload in (
-        ('quotes', {'source': 'Yahoo Finance', 'quotes': quotes}),
+        ('quotes', {'source': 'Twelve Data / Yahoo Finance', 'quotes': quotes}),
         ('news', {'source': 'GDELT', **articles}),
+        ('calendar', {'source': 'BLS', **schedule}),
     ):
         (directory / f'{name}.json').write_text(
             json.dumps({'fetchedAt': fetched, **payload}, ensure_ascii=False, allow_nan=False),
